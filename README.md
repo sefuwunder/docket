@@ -16,6 +16,7 @@ Then open **http://127.0.0.1:3037**. (Bun is the only dependency; there are zero
 - **Event sheets** — iOS-style swipe-up sheet to create/edit events: title, start/end (native pickers), location, notes, color tag, repeat (daily / weekdays / weekly). Destructive delete asks for a tap-to-confirm.
 - **Swipe-to-delete** on agenda rows (swipe left, tap Delete, tap Confirm).
 - **Scheduling agent tab** — a Messages-like chat with a deterministic local natural-language parser. No LLM, no API keys.
+- **External calendars (Settings ⚙)** — an iCal secret URL field (password input, stored server-side in SQLite, never returned to the client) and read-only discovery of GNOME Online Accounts with calendar enabled. Google accounts sync via the Calendar API using GOA's OAuth token (fetched on demand, never stored). External events appear as **read-only busy blocks**: the agent's free-time finder, conflict detection, and "what's on" all account for them — "busy 2–3pm per your google calendar" — but they can never be edited or deleted from Docket. 5-minute TTL cache; a downed source falls back to local-only with a quiet note.
 
 ## Agent language reference
 
@@ -44,6 +45,8 @@ POST   /api/events[?force=1]                        create (409 + conflicts unle
 PUT    /api/events/:id                              update
 DELETE /api/events/:id                              delete
 POST   /api/agent  {message} | {confirmId} | {pickmove}
+GET    /api/settings                                 masked status: ical configured?, GOA accounts (identities redacted)
+POST   /api/settings  {icalUrl} | {goaEnabled}       store iCal secret URL (server-side only) / toggle GOA
 ```
 
 Dates are local `YYYY-MM-DD`, datetimes local `YYYY-MM-DDTHH:MM` — no timezones in v1.
@@ -53,6 +56,9 @@ Dates are local `YYYY-MM-DD`, datetimes local `YYYY-MM-DDTHH:MM` — no timezone
 ```
 src/agent.js    shared ESM: NL parser, free-time finder, conflict logic
                 (imported by bun tests, the server, and the browser)
+src/ical.js     pure ESM: VCALENDAR parser + RRULE expansion → busy blocks
+src/external.js server-side: GOA enumeration, Google Calendar API, iCal fetch,
+                TTL cache — secrets never leave this module
 src/server.ts   Bun server: SQLite storage + REST API + agent endpoint
 public/         index.html, styles.css, app.js (UI)
 tests/          bun test suites
@@ -60,6 +66,5 @@ tests/          bun test suites
 
 ## Future work
 
-- Google Calendar sync (local-first for now)
 - Notifications / reminders
 - Sharing / collaboration

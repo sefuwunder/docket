@@ -6,6 +6,7 @@ import {
   formatTime, formatDay, HELP_TEXT, fmtDate, addDays,
   fromMin, toMin, upcomingWeekday,
 } from './agent.js';
+import { collectExternalBusy, invalidateCache, listGoaCalendarAccounts, redactIdentity } from './external.js';
 
 const PORT = Number(process.env.PORT || 3037);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -26,6 +27,22 @@ db.run(`CREATE TABLE IF NOT EXISTS events (
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 )`);
+db.run(`CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+)`);
+
+const getSetting = (key: string): string | null => {
+  const row = db.query('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | null;
+  return row ? row.value : null;
+};
+const setSetting = (key: string, value: string) => {
+  db.run('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', [key, value]);
+};
+const externalSettings = () => ({
+  icalUrl: getSetting('ical_url') || undefined,
+  goaEnabled: getSetting('goa_enabled') !== '0',
+});
 
 type StoredEvent = {
   id: number; title: string; start: string; end: string;
@@ -74,23 +91,51 @@ function fmtRange(e: { start: string; end: string }, now: Date) {
   return `${formatDay(e.start.slice(0, 10), now)} ${formatTime(e.start)}–${formatTime(e.end)}`;
 }
 
-function conflictReply(title: string, start: string, end: string, now: Date): AgentReply {
+type ExtBlock = { start: string; end: string; title: string; source: string; external: boolean };
+
+// External busy blocks for the day containing `date` (±1 day for cross-midnight).
+async function externalForDate(date: string): Promise<{ blocks: ExtBlock[]; note: string | null }> {
+  const from = new Date(date + 'T00:00:00');
+  const to = new Date(addDays(date, 2) + 'T00:00:00');
+  try {
+    const r = await collectExternalBusy(externalSettings(), from, to);
+    const blocks = (r.blocks as ExtBlock[]).filter((b) => b.start.slice(0, 10) === date);
+    return { blocks, note: r.note };
+  } catch {
+    return { blocks: [], note: 'external calendars unavailable' };
+  }
+}
+
+function externalNoteLine(note: string | null): string {
+  return note ? `\n(External calendars unavailable right now — showing local only.)` : '';
+}
+
+/** "busy 2–3pm per your Google calendar" style name for an external block. */
+function extName(b: { title: string; start: string; end: string; source: string }) {
+  return `'${b.title}' (${formatTime(b.start)}–${formatTime(b.end)} per your ${b.source.toLowerCase()})`;
+}
+
+async function conflictReply(title: string, start: string, end: string, now: Date): Promise<AgentReply> {
   const date = start.slice(0, 10);
   const dayEvents = expanded(date, date);
-  const conflicts = detectConflicts(start, end, dayEvents);
-  const names = conflicts.map((c) => `'${c.title}' (${formatTime(c.start)}–${formatTime(c.end)})`).join(', ');
-  const alts = findFreeSlots(date, Math.round(toMin(end) - toMin(start)), dayEvents, 9, 18, 3, toMin(start));
+  const ext = await externalForDate(date);
+  const allBusy = dayEvents.concat(ext.blocks);
+  const conflicts = detectConflicts(start, end, allBusy);
+  const names = conflicts.map((c) =>
+    c.external ? extName(c as any) : `'${c.title}' (${formatTime(c.start)}–${formatTime(c.end)})`
+  ).join(', ');
+  const alts = findFreeSlots(date, Math.round(toMin(end) - toMin(start)), allBusy, 9, 18, 3, toMin(start));
   const chips: Chip[] = alts.map((s) => ({
     label: formatTime(s.start),
     action: { type: 'create', event: { title, start: s.start, end: s.end } },
   }));
   return {
-    reply: `That overlaps with ${names}. Nearest free times ${formatDay(date, now)}:`,
+    reply: `That overlaps with ${names}. Nearest free times ${formatDay(date, now)}:` + externalNoteLine(ext.note),
     chips,
   };
 }
 
-function handleAgentMessage(message: string, now: Date): AgentReply {
+async function handleAgentMessage(message: string, now: Date): Promise<AgentReply> {
   const p = parseMessage(message, now);
 
   if (p.intent === 'help') return { reply: HELP_TEXT };
@@ -108,23 +153,30 @@ function handleAgentMessage(message: string, now: Date): AgentReply {
   if (p.intent === 'query') {
     if (!p.date) return { reply: "Which day? Try 'what's on Friday?'." };
     const evs = expanded(p.date, p.date);
-    if (!evs.length) return { reply: `Nothing on ${formatDay(p.date, now)} — clear.` };
-    const lines = evs.map((e) => `• ${formatTime(e.start)}–${formatTime(e.end)} ${e.title}`).join('\n');
-    return { reply: `${formatDay(p.date, now)}:\n${lines}` };
+    const ext = await externalForDate(p.date);
+    if (!evs.length && !ext.blocks.length) {
+      return { reply: `Nothing on ${formatDay(p.date, now)} — clear.` + externalNoteLine(ext.note) };
+    }
+    const lines = evs.map((e) => `• ${formatTime(e.start)}–${formatTime(e.end)} ${e.title}`);
+    const extLines = ext.blocks.map((b) => `• ${formatTime(b.start)}–${formatTime(b.end)} ${b.title} (${b.source.toLowerCase()}, read-only)`);
+    const all = [...lines, ...extLines].join('\n');
+    return { reply: `${formatDay(p.date, now)}:\n${all}` + externalNoteLine(ext.note) };
   }
 
   if (p.intent === 'findfree') {
     const evs = expanded(p.date, p.date);
-    const slots = findFreeSlots(p.date, p.minutes, evs, p.window.start, p.window.end, 5);
+    const ext = await externalForDate(p.date);
+    const allBusy = evs.concat(ext.blocks);
+    const slots = findFreeSlots(p.date, p.minutes, allBusy, p.window.start, p.window.end, 5);
     if (!slots.length) {
-      return { reply: `No ${p.minutes}-minute gaps ${formatDay(p.date, now)} ${p.window.label === 'day' ? '' : 'in the ' + p.window.label}.` };
+      return { reply: `No ${p.minutes}-minute gaps ${formatDay(p.date, now)} ${p.window.label === 'day' ? '' : 'in the ' + p.window.label}.` + externalNoteLine(ext.note) };
     }
     const chips: Chip[] = slots.slice(0, 3).map((s) => ({
       label: `${formatTime(s.start)}`,
       action: { type: 'book', start: s.start, end: s.end },
     }));
     const list = slots.slice(0, 5).map((s) => formatTime(s.start)).join(', ');
-    return { reply: `Free ${formatDay(p.date, now)}${p.window.label === 'day' ? '' : ' ' + p.window.label}: ${list}. Tap one to book it:`, chips };
+    return { reply: `Free ${formatDay(p.date, now)}${p.window.label === 'day' ? '' : ' ' + p.window.label}: ${list}. Tap one to book it:` + externalNoteLine(ext.note), chips };
   }
 
   if (p.intent === 'create') {
@@ -135,14 +187,15 @@ function handleAgentMessage(message: string, now: Date): AgentReply {
     const start = `${date}T${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')}`;
     const end = fromMin(toMin(start) + p.minutes);
     const dayEvents = expanded(date, date);
-    const conflicts = detectConflicts(start, end, dayEvents);
+    const ext = await externalForDate(date);
+    const conflicts = detectConflicts(start, end, dayEvents.concat(ext.blocks));
     if (conflicts.length) {
       return conflictReply(p.title, start, end, now);
     }
     const ev = insertEvent({ title: p.title, start, end, rrule: p.recurrence });
     const rec = p.recurrence ? ` (${p.recurrence})` : '';
     return {
-      reply: `Done: '${ev.title}' ${fmtRange(ev, now)}${rec}.`,
+      reply: `Done: '${ev.title}' ${fmtRange(ev, now)}${rec}.` + externalNoteLine(ext.note),
       refresh: true,
     };
   }
@@ -150,7 +203,7 @@ function handleAgentMessage(message: string, now: Date): AgentReply {
   if (p.intent === 'cancel') {
     const from = fmtDate(now), to = addDays(from, 60);
     const matches = matchEvents(p.titleQuery, expanded(from, to), now);
-    if (!matches.length) return { reply: `I couldn't find anything matching '${p.titleQuery}' in the next 60 days.` };
+    if (!matches.length) return { reply: `I couldn't find anything matching '${p.titleQuery}' in the next 60 days. (Events from external calendars are read-only — edit those in your own calendar app.)` };
     if (matches.length > 1) {
       const chips: Chip[] = matches.slice(0, 4).map((e) => {
         const id = rid();
@@ -172,7 +225,7 @@ function handleAgentMessage(message: string, now: Date): AgentReply {
     if (!p.date) return { reply: `Move it to when? Try 'move dentist to Thursday'.` };
     const from = fmtDate(now), to = addDays(from, 60);
     const matches = matchEvents(p.titleQuery, expanded(from, to), now);
-    if (!matches.length) return { reply: `I couldn't find anything matching '${p.titleQuery}' in the next 60 days.` };
+    if (!matches.length) return { reply: `I couldn't find anything matching '${p.titleQuery}' in the next 60 days. (Events from external calendars are read-only — edit those in your own calendar app.)` };
     const pick = (e: any): AgentReply => {
       const durMin = Math.round(toMin(e.end) - toMin(e.start));
       const hh = p.hour != null ? p.hour : Number(e.start.slice(11, 13));
@@ -201,7 +254,7 @@ function handleAgentMessage(message: string, now: Date): AgentReply {
   return { reply: HELP_TEXT };
 }
 
-function handleConfirm(confirmId: string, now: Date): AgentReply {
+async function handleConfirm(confirmId: string, now: Date): Promise<AgentReply> {
   const p = pending.get(confirmId);
   if (!p) return { reply: 'That confirmation expired — tell me again?' };
   pending.delete(confirmId);
@@ -212,7 +265,8 @@ function handleConfirm(confirmId: string, now: Date): AgentReply {
   if (p.kind === 'move' && p.eventId && p.to) {
     const row = db.query('SELECT * FROM events WHERE id = ?').get(p.eventId) as StoredEvent | null;
     if (!row) return { reply: 'That event is gone already.' };
-    const conflicts = detectConflicts(p.to.start, p.to.end, expanded(p.to.start.slice(0, 10), p.to.start.slice(0, 10)), p.eventId);
+    const ext = await externalForDate(p.to.start.slice(0, 10));
+    const conflicts = detectConflicts(p.to.start, p.to.end, expanded(p.to.start.slice(0, 10), p.to.start.slice(0, 10)).concat(ext.blocks), p.eventId);
     if (conflicts.length) {
       return conflictReply(row.title, p.to.start, p.to.end, now);
     }
@@ -223,6 +277,24 @@ function handleConfirm(confirmId: string, now: Date): AgentReply {
 }
 
 // ---------- http ----------
+
+/** Settings status for the client: masked, never includes secrets. */
+async function settingsStatus() {
+  const icalConfigured = !!(getSetting('ical_url') || '').trim();
+  let goaAccounts: { id: string; identity: string; provider: string }[] = [];
+  try {
+    goaAccounts = (await listGoaCalendarAccounts()).map((a: any) => ({
+      id: a.id,
+      identity: redactIdentity(a.identity),
+      provider: a.providerName,
+    }));
+  } catch { /* GOA unreachable — list stays empty, quiet */ }
+  return {
+    ical: { configured: icalConfigured },
+    goaEnabled: getSetting('goa_enabled') !== '0',
+    goa: goaAccounts,
+  };
+}
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -296,7 +368,7 @@ const server = Bun.serve({
       if (pathname === '/api/agent' && req.method === 'POST') {
         const b = await req.json();
         if (b.confirmId) {
-          return Response.json(handleConfirm(String(b.confirmId), now));
+          return Response.json(await handleConfirm(String(b.confirmId), now));
         }
         if (b.pickmove) {
           // second step of ambiguous move: {pickId, date, hour, minute}
@@ -317,7 +389,24 @@ const server = Bun.serve({
         if (!b.message || !String(b.message).trim()) {
           return Response.json({ reply: HELP_TEXT });
         }
-        return Response.json(handleAgentMessage(String(b.message), now));
+        return Response.json(await handleAgentMessage(String(b.message), now));
+      }
+      // ----- settings (secrets stay server-side; GET never returns them) -----
+      if (pathname === '/api/settings' && req.method === 'GET') {
+        return Response.json(await settingsStatus());
+      }
+      if (pathname === '/api/settings' && req.method === 'POST') {
+        const b = await req.json().catch(() => ({}));
+        if ('icalUrl' in b) {
+          const v = String(b.icalUrl || '').trim();
+          setSetting('ical_url', v);
+          invalidateCache();
+        }
+        if ('goaEnabled' in b) {
+          setSetting('goa_enabled', b.goaEnabled ? '1' : '0');
+          invalidateCache();
+        }
+        return Response.json(await settingsStatus());
       }
 
       // ----- static -----

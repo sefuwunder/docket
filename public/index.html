@@ -17,6 +17,9 @@
     <div class="topbar">
       <h1 class="large-title" id="cal-title">Calendar</h1>
       <p class="subhead" id="cal-sub"></p>
+      <button class="icon-btn" id="btn-settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.09a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.09a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/></svg>
+      </button>
     </div>
     <div class="segmented" role="tablist">
       <button data-seg="month" class="active">Month</button>
@@ -48,6 +51,37 @@
       <div class="composer">
         <input id="chat-input" type="text" placeholder="Message" autocomplete="off" enterkeyhint="send">
         <button id="chat-send" aria-label="Send">↑</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======== SETTINGS ======== -->
+  <section class="view hidden fullscreen" id="view-settings">
+    <div class="topbar">
+      <h1 class="large-title">Settings</h1>
+      <button class="icon-btn" id="btn-settings-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="settings-body">
+      <div class="settings-group">
+        <h3>External calendars</h3>
+        <p class="settings-note">External events appear as read-only busy blocks — the agent avoids them, but can't edit or delete them.</p>
+        <div class="field"><label>iCal secret URL</label>
+          <input id="s-ical" type="password" placeholder="https://…" autocomplete="off">
+        </div>
+        <p class="settings-status" id="s-ical-status"></p>
+        <div class="btn-row">
+          <button class="btn primary" id="s-ical-save">Save</button>
+          <button class="btn ghost" id="s-ical-clear">Remove</button>
+        </div>
+      </div>
+      <div class="settings-group">
+        <h3>GNOME Online Accounts</h3>
+        <label class="toggle-row"><span>Use calendar accounts</span>
+          <input id="s-goa-enabled" type="checkbox">
+        </label>
+        <div id="s-goa-list"><p class="settings-note">Loading…</p></div>
       </div>
     </div>
   </section>

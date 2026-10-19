@@ -456,3 +456,53 @@ addMsg("Hi — I'm your scheduling agent. Tell me what to put on the calendar.",
 suggestions();
 refreshEvents();
 setInterval(() => { if (state.seg === 'day') renderDay(); }, 60000);
+
+// ---------- settings ----------
+async function loadSettings() {
+  const s = await api('/api/settings');
+  $('#s-ical-status').textContent = s.ical.configured ? 'Configured ✓ (value never leaves the server)' : 'Not configured';
+  $('#s-goa-enabled').checked = !!s.goaEnabled;
+  const list = $('#s-goa-list');
+  if (!s.goa.length) {
+    list.innerHTML = '<p class="settings-note">No calendar accounts found on this machine. Add one in GNOME Settings → Online Accounts.</p>';
+  } else {
+    list.innerHTML = '';
+    for (const a of s.goa) {
+      const d = document.createElement('div');
+      d.className = 'goa-item';
+      d.innerHTML = `<span>${a.identity}<span class="prov">${a.provider}</span></span><span class="settings-note">synced on refresh</span>`;
+      list.appendChild(d);
+    }
+  }
+}
+function openSettings() {
+  $('#view-settings').classList.remove('hidden');
+  loadSettings().catch((e) => toast(e.message || 'settings failed'));
+}
+function closeSettings() { $('#view-settings').classList.add('hidden'); }
+$('#btn-settings').onclick = openSettings;
+$('#btn-settings-close').onclick = closeSettings;
+$('#s-ical-save').onclick = async () => {
+  const v = $('#s-ical').value.trim();
+  if (!v) { toast('Paste the iCal URL first'); return; }
+  try {
+    const s = await api('/api/settings', { method: 'POST', body: JSON.stringify({ icalUrl: v }) });
+    $('#s-ical').value = '';
+    $('#s-ical-status').textContent = s.ical.configured ? 'Configured ✓' : 'Not configured';
+    toast('iCal URL saved');
+  } catch (e) { toast(e.message || 'save failed'); }
+};
+$('#s-ical-clear').onclick = async () => {
+  try {
+    const s = await api('/api/settings', { method: 'POST', body: JSON.stringify({ icalUrl: '' }) });
+    $('#s-ical').value = '';
+    $('#s-ical-status').textContent = 'Not configured';
+    toast('iCal URL removed');
+  } catch (e) { toast(e.message || 'remove failed'); }
+};
+$('#s-goa-enabled').onchange = async (e) => {
+  try {
+    await api('/api/settings', { method: 'POST', body: JSON.stringify({ goaEnabled: e.target.checked }) });
+    toast(e.target.checked ? 'GOA calendars on' : 'GOA calendars off');
+  } catch (err) { toast(err.message || 'failed'); }
+};
