@@ -199,7 +199,8 @@ export function cleanTitle(raw) {
 
 /**
  * Parse a chat message into an intent object.
- * intents: create | move | cancel | query | findfree | confirm | help | unknown
+ * intents: create | move | cancel | query | findfree | trainmodel | patterns |
+ *   confirm | help | unknown
  */
 export function parseMessage(text, now) {
   const t = text.trim();
@@ -213,6 +214,13 @@ export function parseMessage(text, now) {
   }
   if (/^(no|nope|cancel that|never ?mind)\b/.test(low)) {
     return { intent: 'abort' };
+  }
+
+  if (/\btrain\b.*\bmodel\b|\bretrain\b/.test(low)) {
+    return { intent: 'trainmodel' };
+  }
+  if (/\bpatterns?\b/.test(low) || /\bcategorize my (week|month)\b/.test(low) || /\bwhat do you see\b/.test(low)) {
+    return { intent: 'patterns' };
   }
 
   let m = low.match(/^(move|reschedule|shift|postpone)\s+(.+?)\s+to\s+(.+)$/);
@@ -434,4 +442,6 @@ export const HELP_TEXT =
   `• "Move dentist to Thursday"\n` +
   `• "Cancel lunch with Ana"\n` +
   `• "What's on Tuesday?"\n` +
-  `• "Find 30 min free tomorrow afternoon"`;
+  `• "Find 30 min free tomorrow afternoon"\n` +
+  `• "train the model"\n` +
+  `• "what patterns do you see"`;

@@ -7,6 +7,7 @@ import {
   fromMin, toMin, upcomingWeekday,
 } from './agent.js';
 import { collectExternalBusy, invalidateCache, listGoaCalendarAccounts, redactIdentity, toCalendarEvent } from './external.js';
+import { train, predictEvent, deserialize, summarizePatterns, topWords, MIN_LABELED } from './model.js';
 
 const PORT = Number(process.env.PORT || 3037);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -31,6 +32,12 @@ db.run(`CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 )`);
+// Honest labels: color_set=1 means the user explicitly chose the color (event
+// sheet, agent tag chip). Untouched defaults (schema DEFAULT 'blue') are NOT
+// training labels — only explicit tags train the category model.
+if (!db.query(`SELECT 1 FROM pragma_table_info('events') WHERE name='color_set'`).get()) {
+  db.run(`ALTER TABLE events ADD COLUMN color_set INTEGER DEFAULT 0`);
+}
 
 const getSetting = (key: string): string | null => {
   const row = db.query('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | null;
@@ -46,7 +53,7 @@ const externalSettings = () => ({
 
 type StoredEvent = {
   id: number; title: string; start: string; end: string;
-  location: string; notes: string; color: string;
+  location: string; notes: string; color: string; color_set: number;
   rrule: string | null; rrule_until: string | null;
 };
 
@@ -70,13 +77,59 @@ function validateEvent(b: any): string | null {
 
 function insertEvent(b: any): StoredEvent {
   const r = db.query(
-    `INSERT INTO events (title, start, end, location, notes, color, rrule, rrule_until)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+    `INSERT INTO events (title, start, end, location, notes, color, color_set, rrule, rrule_until)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
   ).get(
     String(b.title).trim(), b.start, b.end, b.location || '', b.notes || '',
-    b.color || 'blue', b.rrule || null, b.rrule_until || null
+    b.color || 'blue', b.color ? 1 : 0, b.rrule || null, b.rrule_until || null
   ) as StoredEvent;
   return r;
+}
+
+/** Load the trained category model, or null when none is stored. */
+function loadModel(): any | null {
+  const raw = getSetting('category_model');
+  if (!raw) return null;
+  try { return deserialize(raw); } catch { return null; }
+}
+
+function modelMeta(): any | null {
+  const raw = getSetting('category_model_meta');
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+/** Labeled training examples from the past 30 days (local, explicit tags). */
+function trainingExamples(now: Date) {
+  const to = fmtDate(now);
+  const from = addDays(to, -30);
+  return expandAll(allStored(), from, to).filter((e: any) => e.color_set === 1);
+}
+
+/** Train the category model and persist it. Returns the API payload. */
+function trainModel(now: Date) {
+  const examples = trainingExamples(now);
+  const r = train(examples);
+  if (!r.ok) {
+    return {
+      trained: false,
+      reason: r.reason,
+      n: r.n,
+      hint: 'Tag at least 10 events with a color (event sheet or the agent\'s tag suggestion), then train again.',
+    };
+  }
+  setSetting('category_model', JSON.stringify(r.model));
+  const meta = {
+    trainedAt: new Date().toISOString(),
+    n: r.stats.n,
+    classes: r.stats.classes,
+    trainAcc: r.stats.trainAcc,
+    cvAcc: r.stats.cvAcc,
+    perClass: r.stats.perClass,
+    smallSample: r.stats.smallSample,
+  };
+  setSetting('category_model_meta', JSON.stringify(meta));
+  return { trained: true, ...meta };
 }
 
 // ---------- agent ----------
@@ -150,6 +203,37 @@ async function handleAgentMessage(message: string, now: Date): Promise<AgentRepl
     return { reply: 'Tap one of the confirmation buttons above, or tell me what to do.' };
   }
 
+  if (p.intent === 'trainmodel') {
+    const r = trainModel(now);
+    if (!r.trained) {
+      return { reply: `Can't train yet: ${r.reason} (have ${r.n}, need ${r.minN ?? 10}). ${r.hint}` };
+    }
+    const acc = r.cvAcc != null
+      ? `Cross-validated accuracy ${(r.cvAcc * 100).toFixed(0)}% on ${r.n} tagged events`
+      : `Accuracy ${(r.trainAcc * 100).toFixed(0)}% on ${r.n} tagged events (too few to cross-validate)`;
+    const small = r.smallSample ? ' — small sample, take the numbers lightly.' : '.';
+    const per = Object.entries(r.perClass).map(([c, n]) => `${n} ${c}`).join(', ');
+    return { reply: `Model trained on your last 30 days: ${acc}${small} Tagged mix: ${per}. I'll now suggest a tag when I create events — you always confirm.` };
+  }
+
+  if (p.intent === 'patterns') {
+    const examples = trainingExamples(now);
+    if (examples.length < MIN_LABELED) {
+      return { reply: `Not enough tagged history yet — I need at least 10 events with an explicit color tag to see patterns. Tag some events, then say "train the model".` };
+    }
+    const s = summarizePatterns(examples, loadModel());
+    const dist = Object.entries(s.dist).sort((a, b) => (b[1] as number) - (a[1] as number))
+      .map(([c, n]) => `${n} ${c}`).join(', ');
+    const lines = [`Last 30 days (${s.n} tagged events): ${dist}.`];
+    for (const [c, words] of Object.entries(s.topWordsByClass)) {
+      if ((words as string[]).length) lines.push(`${c} smells like: ${(words as string[]).join(', ')}.`);
+    }
+    for (const h of s.habits) {
+      lines.push(`Your ${h.when.toLowerCase()} are usually ${h.cls} (${h.n} of ${h.total}).`);
+    }
+    return { reply: lines.join('\n') };
+  }
+
   if (p.intent === 'query') {
     if (!p.date) return { reply: "Which day? Try 'what's on Friday?'." };
     const evs = expanded(p.date, p.date);
@@ -194,8 +278,27 @@ async function handleAgentMessage(message: string, now: Date): Promise<AgentRepl
     }
     const ev = insertEvent({ title: p.title, start, end, rrule: p.recurrence });
     const rec = p.recurrence ? ` (${p.recurrence})` : '';
+    const chips: Chip[] = [];
+    // Category suggestion: never auto-applied — the chip asks first.
+    // Suggest only when the model has a clear favorite (top >= 0.5 and
+    // >= 1.5x the runner-up), not on coin-flip predictions.
+    const model = loadModel();
+    if (model) {
+      try {
+        const preds = predictEvent({ title: ev.title, start: ev.start, end: ev.end }, model);
+        const top = preds[0], second = preds[1];
+        if (top && top.class !== ev.color && COLORS.includes(top.class) &&
+            top.prob >= 0.5 && top.prob >= 1.5 * (second ? second.prob : 0)) {
+          chips.push({
+            label: `Tag ${top.class} (${Math.round(top.prob * 100)}%)`,
+            action: { type: 'applytag', eventId: ev.id, color: top.class },
+          });
+        }
+      } catch { /* prediction is advisory; never break creation */ }
+    }
     return {
       reply: `Done: '${ev.title}' ${fmtRange(ev, now)}${rec}.` + externalNoteLine(ext.note),
+      chips: chips.length ? chips : undefined,
       refresh: true,
     };
   }
@@ -372,9 +475,10 @@ const server = Bun.serve({
         const next = { ...row, ...b, id: Number(m[1]) };
         const err = validateEvent(next);
         if (err) return Response.json({ error: err }, { status: 400 });
+        const colorSet = ('color' in b) ? 1 : row.color_set;
         db.run(
-          `UPDATE events SET title=?, start=?, end=?, location=?, notes=?, color=?, rrule=?, rrule_until=?, updated_at=datetime('now') WHERE id=?`,
-          [next.title, next.start, next.end, next.location, next.notes, next.color, next.rrule, next.rrule_until, next.id]
+          `UPDATE events SET title=?, start=?, end=?, location=?, notes=?, color=?, color_set=?, rrule=?, rrule_until=?, updated_at=datetime('now') WHERE id=?`,
+          [next.title, next.start, next.end, next.location, next.notes, next.color, colorSet, next.rrule, next.rrule_until, next.id]
         );
         return Response.json(next);
       }
@@ -388,6 +492,15 @@ const server = Bun.serve({
         const b = await req.json();
         if (b.confirmId) {
           return Response.json(await handleConfirm(String(b.confirmId), now));
+        }
+        if (b.applytag) {
+          // tag-suggestion confirmation: {eventId, color} — explicit user choice
+          const color = String(b.applytag.color || '');
+          const row = db.query('SELECT * FROM events WHERE id = ?').get(b.applytag.eventId) as StoredEvent | null;
+          if (!row) return Response.json({ reply: 'That event is gone already.' });
+          if (!COLORS.includes(color)) return Response.json({ reply: 'Unknown color tag.' });
+          db.run(`UPDATE events SET color = ?, color_set = 1, updated_at = datetime('now') WHERE id = ?`, [color, row.id]);
+          return Response.json({ reply: `Tagged '${row.title}' ${color}.`, refresh: true });
         }
         if (b.pickmove) {
           // second step of ambiguous move: {pickId, date, hour, minute}
@@ -409,6 +522,31 @@ const server = Bun.serve({
           return Response.json({ reply: HELP_TEXT });
         }
         return Response.json(await handleAgentMessage(String(b.message), now));
+      }
+      // ----- category model (local discriminative tagger) -----
+      if (pathname === '/api/model/train' && req.method === 'POST') {
+        return Response.json(trainModel(now));
+      }
+      if (pathname === '/api/model/status' && req.method === 'GET') {
+        const meta = modelMeta();
+        return Response.json(meta ? { trained: true, ...meta } : { trained: false });
+      }
+      if (pathname === '/api/model/predict' && req.method === 'GET') {
+        // advisory suggestion for the event sheet: ?title=&start=&end=
+        const model = loadModel();
+        const title = url.searchParams.get('title') || '';
+        const start = url.searchParams.get('start') || '';
+        const end = url.searchParams.get('end') || '';
+        if (!model || !title.trim() || !start || !end) {
+          return Response.json({ suggestions: [] });
+        }
+        try {
+          const preds = predictEvent({ title, start, end }, model)
+            .filter((p) => p.prob >= 0.5).slice(0, 2);
+          return Response.json({ suggestions: preds });
+        } catch {
+          return Response.json({ suggestions: [] });
+        }
       }
       // ----- settings (secrets stay server-side; GET never returns them) -----
       if (pathname === '/api/settings' && req.method === 'GET') {

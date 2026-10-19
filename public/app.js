@@ -271,7 +271,7 @@ function fillColors(sel) {
     const b = document.createElement('button');
     b.style.background = hex;
     b.classList.toggle('sel', name === sel);
-    b.onclick = () => { w.dataset.color = name; fillColors(name); };
+    b.onclick = () => { w.dataset.color = name; fillColors(name); hideTagSuggest(); };
     w.appendChild(b);
   }
   w.dataset.color = sel;
@@ -296,10 +296,47 @@ function openSheet(ev = {}) {
   $('#scrim').classList.add('show');
   $('#sheet').classList.add('show');
   setTimeout(() => $('#f-title').focus(), 300);
+  hideTagSuggest();
+  maybeSuggestTag();
 }
 function closeSheet() {
   $('#scrim').classList.remove('show');
   $('#sheet').classList.remove('show');
+  hideTagSuggest();
+}
+
+// ---------- tag suggestion (advisory; an explicit color choice always wins) ----------
+let tagSuggestTimer = null;
+function hideTagSuggest() {
+  const el = $('#tag-suggest');
+  if (!el) return;
+  el.innerHTML = '';
+  el.style.display = 'none';
+}
+function maybeSuggestTag() {
+  clearTimeout(tagSuggestTimer);
+  tagSuggestTimer = setTimeout(async () => {
+    const title = $('#f-title').value.trim();
+    const start = $('#f-start').value, end = $('#f-end').value;
+    hideTagSuggest();
+    if (title.length < 3 || !start || !end) return;
+    try {
+      const r = await api(`/api/model/predict?title=${encodeURIComponent(title)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
+      const s = (r.suggestions || [])[0];
+      const cur = $('#f-colors').dataset.color || 'blue';
+      if (!s || s.class === cur) return;
+      const el = $('#tag-suggest');
+      const b = document.createElement('button');
+      b.className = 'chip';
+      b.textContent = `Tag ${s.class} (${Math.round(s.prob * 100)}%)?`;
+      b.onclick = () => { fillColors(s.class); hideTagSuggest(); };
+      el.appendChild(b);
+      el.style.display = '';
+    } catch { /* advisory only — never break the sheet */ }
+  }, 400);
+}
+for (const id of ['f-title', 'f-start', 'f-end']) {
+  $('#' + id).addEventListener('input', maybeSuggestTag);
 }
 /** Read-only info sheet for external events — never the edit sheet. */
 function openInfoSheet(ev) {
@@ -418,6 +455,10 @@ async function handleChip(chip) {
   if (a.type === 'confirm' || a.type === 'pickmove') {
     const body = a.type === 'confirm' ? { confirmId: a.confirmId } : { pickmove: a };
     const r = await api('/api/agent', { method: 'POST', body: JSON.stringify(body) });
+    return agentReply(r);
+  }
+  if (a.type === 'applytag') {
+    const r = await api('/api/agent', { method: 'POST', body: JSON.stringify({ applytag: a }) });
     return agentReply(r);
   }
   if (a.type === 'book') {
