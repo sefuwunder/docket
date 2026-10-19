@@ -43,7 +43,7 @@ async function refreshEvents() {
   // load a generous window around the cursor
   const from = addDays(state.monthCursor + '-01', -7);
   const to = addDays(state.monthCursor + '-01', 75);
-  state.events = await api(`/api/events?from=${from}&to=${to}`);
+  state.events = await api(`/api/events?from=${from}&to=${to}&external=1`);
   render();
 }
 
@@ -100,7 +100,9 @@ function renderMonth() {
       const ds = `${state.monthCursor}-${String(dayNum).padStart(2, '0')}`;
       const evs = (byDay[ds] || []).slice(0, 3);
       btn.innerHTML = `<span class="dnum">${dayNum}</span><span class="dots">${
-        evs.map((e) => `<i style="background:${COLORS[e.color] || COLORS.blue}"></i>`).join('')
+        evs.map((e) => e.external
+          ? `<i class="ext"></i>`
+          : `<i style="background:${COLORS[e.color] || COLORS.blue}"></i>`).join('')
       }</span>`;
       if (ds === today) btn.classList.add('today');
       if (ds === state.selectedDate) btn.classList.add('selected');
@@ -143,12 +145,12 @@ function renderDay() {
     const top = (sh + sm / 60) * HOUR_H;
     const height = Math.max(24, (eh + em / 60 - (sh + sm / 60)) * HOUR_H - 3);
     const b = document.createElement('button');
-    b.className = 'event-block';
+    b.className = 'event-block' + (e.external ? ' ext' : '');
     b.style.top = top + 'px';
     b.style.height = height + 'px';
-    b.style.background = COLORS[e.color] || COLORS.blue;
-    b.innerHTML = `<span class="et">${escapeHtml(e.title)}</span><span class="eh">${formatTime(e.start)} – ${formatTime(e.end)}</span>`;
-    b.onclick = (ev) => { ev.stopPropagation(); openSheet(e); };
+    if (!e.external) b.style.background = COLORS[e.color] || COLORS.blue;
+    b.innerHTML = `<span class="et">${escapeHtml(e.title)}</span><span class="eh">${formatTime(e.start)} – ${formatTime(e.end)}${e.external ? ' · ' + escapeHtml(e.source || '') : ''}</span>`;
+    b.onclick = (ev) => { ev.stopPropagation(); e.external ? openInfoSheet(e) : openSheet(e); };
     tl.appendChild(b);
   }
 
@@ -197,21 +199,29 @@ function renderAgenda() {
 }
 
 function agendaRow(e) {
+  const ext = !!e.external;
   const row = document.createElement('div');
   row.className = 'swipe-row';
   row.innerHTML = `
     <div class="swipe-inner">
-      <button class="agenda-item">
-        <span class="colorbar" style="background:${COLORS[e.color] || COLORS.blue}"></span>
+      <button class="agenda-item${ext ? ' ext' : ''}">
+        <span class="colorbar" style="background:${ext ? 'var(--text-3)' : (COLORS[e.color] || COLORS.blue)}"></span>
         <span class="at">${formatTime(e.start)} – ${formatTime(e.end)}</span>
         <span class="ti">${escapeHtml(e.title)}</span>
+        ${ext ? `<span class="src-tag">${escapeHtml(e.source || 'external')}</span>` : ''}
       </button>
-      <button class="swipe-del">Delete</button>
+      ${ext ? '' : '<button class="swipe-del">Delete</button>'}
     </div>`;
   const inner = row.querySelector('.swipe-inner');
   const del = row.querySelector('.swipe-del');
   const item = row.querySelector('.agenda-item');
   let startX = 0, dx = 0, open = false;
+
+  if (ext) {
+    // external events are read-only: info sheet, no swipe-to-delete
+    item.addEventListener('click', () => openInfoSheet(e));
+    return row;
+  }
 
   inner.addEventListener('touchstart', (t) => {
     startX = t.touches[0].clientX; dx = 0;
@@ -269,6 +279,7 @@ function fillColors(sel) {
 
 /** ev may be a stored event, an occurrence, or a {start,end} draft */
 function openSheet(ev = {}) {
+  if (ev && ev.external) return openInfoSheet(ev);
   state.editingId = ev.occurrenceOf ?? ev.id ?? null;
   $('#sheet-title').textContent = state.editingId ? 'Edit Event' : 'New Event';
   $('#f-title').value = ev.title || '';
@@ -290,10 +301,30 @@ function closeSheet() {
   $('#scrim').classList.remove('show');
   $('#sheet').classList.remove('show');
 }
-$('#scrim').onclick = closeSheet;
+/** Read-only info sheet for external events — never the edit sheet. */
+function openInfoSheet(ev) {
+  $('#info-title').textContent = ev.title || 'Busy';
+  const d = new Date(ev.start.slice(0, 10) + 'T12:00');
+  $('#info-when').textContent =
+    d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }) +
+    ' · ' + formatTime(ev.start) + ' – ' + formatTime(ev.end);
+  $('#info-src').textContent = ev.source || 'External calendar';
+  $('#scrim').classList.add('show');
+  $('#infosheet').classList.add('show');
+}
+function closeInfoSheet() {
+  $('#scrim').classList.remove('show');
+  $('#infosheet').classList.remove('show');
+}
+$('#scrim').onclick = () => { closeSheet(); closeInfoSheet(); };
+$('#infosheet-close').onclick = closeInfoSheet;
 $('#sheet-cancel').onclick = closeSheet;
 
 $('#sheet-save').onclick = async () => {
+  if (state.editingId && String(state.editingId).startsWith('ext:')) {
+    toast('External events are read-only');
+    return;
+  }
   const body = {
     title: $('#f-title').value.trim(),
     start: $('#f-start').value,
@@ -324,6 +355,10 @@ $('#sheet-save').onclick = async () => {
 };
 
 $('#sheet-delete').onclick = async function () {
+  if (state.editingId && String(state.editingId).startsWith('ext:')) {
+    toast('External events are read-only');
+    return;
+  }
   if (!this.classList.contains('confirm')) {
     this.classList.add('confirm');
     this.textContent = 'Tap again to confirm delete';
@@ -463,18 +498,50 @@ async function loadSettings() {
   $('#s-ical-status').textContent = s.ical.configured ? 'Configured ✓ (value never leaves the server)' : 'Not configured';
   $('#s-goa-enabled').checked = !!s.goaEnabled;
   const list = $('#s-goa-list');
+  list.innerHTML = '';
   if (!s.goa.length) {
     list.innerHTML = '<p class="settings-note">No calendar accounts found on this machine. Add one in GNOME Settings → Online Accounts.</p>';
   } else {
-    list.innerHTML = '';
     for (const a of s.goa) {
       const d = document.createElement('div');
       d.className = 'goa-item';
-      d.innerHTML = `<span>${a.identity}<span class="prov">${a.provider}</span></span><span class="settings-note">synced on refresh</span>`;
+      d.dataset.acc = a.id;
+      d.innerHTML = `<span>${escapeHtml(a.identity)}<span class="prov">${escapeHtml(a.provider)}</span></span><span class="settings-note goa-st">not synced yet — tap Sync now</span>`;
       list.appendChild(d);
     }
   }
+  $('#s-sync-note').textContent = '';
 }
+function statusLabel(st) {
+  if (st.status === 'synced') return `synced · ${st.count} event${st.count === 1 ? '' : 's'}`;
+  if (st.status === 'needs re-auth') return 'needs re-auth — sign in again in GNOME Settings';
+  if (st.status === 'unsupported provider') return 'unsupported provider';
+  return 'error — will retry on next sync';
+}
+$('#s-sync').onclick = async () => {
+  const btn = $('#s-sync');
+  btn.disabled = true;
+  btn.textContent = 'Syncing…';
+  try {
+    const r = await api('/api/sync', { method: 'POST' });
+    $('#s-sync-note').textContent = r.note || '';
+    for (const st of r.accountStatus) {
+      const el = document.querySelector(`#s-goa-list .goa-item[data-acc="${CSS.escape(st.id)}"] .goa-st`);
+      if (el) {
+        el.textContent = statusLabel(st);
+        el.classList.toggle('warn', st.status !== 'synced');
+      }
+    }
+    if (!r.accountStatus.length) {
+      $('#s-goa-list').innerHTML = `<p class="settings-note">${escapeHtml(r.note || 'Nothing synced.')}</p>`;
+    } else if (!r.note && r.count > 0) {
+      $('#s-sync-note').textContent = `${r.count} external event${r.count === 1 ? '' : 's'} found.`;
+    }
+    await refreshEvents(); // calendar views pick up the external events
+  } catch (e) { $('#s-sync-note').textContent = e.message || 'Sync failed'; }
+  btn.disabled = false;
+  btn.textContent = 'Sync now';
+};
 function openSettings() {
   $('#view-settings').classList.remove('hidden');
   loadSettings().catch((e) => toast(e.message || 'settings failed'));

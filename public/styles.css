@@ -281,3 +281,27 @@ body {
   padding: 8px 0; border-top: 1px solid var(--hairline); font-size: 14px;
 }
 .goa-item .prov { color: var(--text-2); font-size: 12px; display: block; }
+
+/* external (GOA / iCal) events — read-only, visually distinct */
+.dots i.ext {
+  background: transparent;
+  border: 1.5px solid var(--text-2);
+  width: 3px; height: 3px;
+}
+.event-block.ext {
+  background: repeating-linear-gradient(45deg,
+    rgba(142,142,147,0.42) 0 6px, rgba(142,142,147,0.16) 6px 12px);
+  border: 1px solid var(--text-3);
+  color: var(--text);
+  box-shadow: none;
+}
+.event-block.ext .eh { opacity: 1; color: var(--text-2); }
+.src-tag {
+  font-size: 11px; font-weight: 500; color: var(--text-2);
+  background: var(--bubble-agent); border-radius: 6px;
+  padding: 2px 7px; flex: none; margin-left: auto;
+}
+.agenda-item.ext .ti { font-weight: 500; }
+.info-when { font-size: 15px; margin: 4px 0; color: var(--text); }
+.info-src { font-size: 13px; color: var(--text-2); margin: 0 0 8px; }
+.goa-st.warn { color: var(--destructive); }

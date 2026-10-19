@@ -82,6 +82,10 @@
           <input id="s-goa-enabled" type="checkbox">
         </label>
         <div id="s-goa-list"><p class="settings-note">Loading…</p></div>
+        <div class="btn-row">
+          <button class="btn primary" id="s-sync">Sync now</button>
+        </div>
+        <p class="settings-status" id="s-sync-note"></p>
       </div>
     </div>
   </section>
@@ -131,6 +135,20 @@
   </div>
 
   <div class="toast" id="toast"></div>
+
+  <!-- read-only info sheet for external (GOA / iCal) events -->
+  <div class="sheet" id="infosheet" role="dialog" aria-modal="true">
+    <div class="grabber"></div>
+    <div class="sheet-body">
+      <h2 id="info-title"></h2>
+      <p class="info-when" id="info-when"></p>
+      <p class="info-src" id="info-src"></p>
+      <p class="settings-note">Read-only — edit this in your own calendar app.</p>
+      <div class="btn-row">
+        <button class="btn primary" id="infosheet-close">Close</button>
+      </div>
+    </div>
+  </div>
 </div>
 <script type="module" src="/app.js"></script>
 </body>

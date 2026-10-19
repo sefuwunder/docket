@@ -6,7 +6,7 @@ import {
   formatTime, formatDay, HELP_TEXT, fmtDate, addDays,
   fromMin, toMin, upcomingWeekday,
 } from './agent.js';
-import { collectExternalBusy, invalidateCache, listGoaCalendarAccounts, redactIdentity } from './external.js';
+import { collectExternalBusy, invalidateCache, listGoaCalendarAccounts, redactIdentity, toCalendarEvent } from './external.js';
 
 const PORT = Number(process.env.PORT || 3037);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -330,10 +330,25 @@ const server = Bun.serve({
       if (pathname === '/api/events' && req.method === 'GET') {
         const from = url.searchParams.get('from') || fmtDate(now);
         const to = url.searchParams.get('to') || addDays(from, 62);
-        return Response.json(expanded(from, to));
+        const local = expanded(from, to);
+        if (url.searchParams.get('external') === '1') {
+          // calendar views: local events + external busy blocks as read-only
+          // 'ext:'-namespaced events
+          const wFrom = new Date(from + 'T00:00');
+          const wTo = new Date(addDays(to, 1) + 'T00:00');
+          const ext = await collectExternalBusy(externalSettings(), wFrom, wTo)
+            .catch(() => ({ blocks: [] as any[] }));
+          const all = local.concat((ext.blocks || []).map(toCalendarEvent))
+            .sort((a, b) => (a.start < b.start ? -1 : 1));
+          return Response.json(all);
+        }
+        return Response.json(local);
       }
       if (pathname === '/api/events' && req.method === 'POST') {
         const b = await req.json();
+        if (b && b.id && String(b.id).startsWith('ext:')) {
+          return Response.json({ error: 'external events are read-only' }, { status: 400 });
+        }
         const err = validateEvent(b);
         if (err) return Response.json({ error: err }, { status: 400 });
         const force = url.searchParams.get('force') === '1';
@@ -344,6 +359,10 @@ const server = Bun.serve({
           }
         }
         return Response.json(insertEvent(b), { status: 201 });
+      }
+      // External blocks are read-only: never let an edit path touch one.
+      if (pathname.startsWith('/api/events/ext:') && (req.method === 'PUT' || req.method === 'DELETE')) {
+        return Response.json({ error: 'external events are read-only' }, { status: 409 });
       }
       let m = pathname.match(/^\/api\/events\/(\d+)$/);
       if (m && req.method === 'PUT') {
@@ -394,6 +413,35 @@ const server = Bun.serve({
       // ----- settings (secrets stay server-side; GET never returns them) -----
       if (pathname === '/api/settings' && req.method === 'GET') {
         return Response.json(await settingsStatus());
+      }
+      // ----- manual sync: run the external collectors now and report REAL
+      // per-account statuses (never the hardcoded "synced" label). -----
+      if (pathname === '/api/sync' && req.method === 'POST') {
+        invalidateCache();
+        const s = externalSettings();
+        const wFrom = new Date(addDays(fmtDate(now), -45) + 'T00:00');
+        const wTo = new Date(addDays(fmtDate(now), 46) + 'T00:00');
+        const r = await collectExternalBusy(s, wFrom, wTo);
+        const blocks = r.blocks || [];
+        const accountStatus = (r.accountStatus || []).map((st: any) => ({
+          ...st,
+          count: blocks.filter((b: any) => b.accountId === st.id).length,
+        }));
+        if (s.icalUrl) {
+          const icalFailed = (r.note || '').includes('iCal feed unreachable');
+          accountStatus.push({
+            id: 'ical', identity: 'iCal feed', provider: 'iCal',
+            status: icalFailed ? 'error' : 'synced',
+            count: blocks.filter((b: any) => b.accountId === 'ical').length,
+          });
+        }
+        let note = r.note;
+        if (!accountStatus.length && !note) {
+          note = s.goaEnabled
+            ? 'No calendar accounts found on this machine.'
+            : 'External calendars are turned off in Settings.';
+        }
+        return Response.json({ count: blocks.length, accountStatus, note });
       }
       if (pathname === '/api/settings' && req.method === 'POST') {
         const b = await req.json().catch(() => ({}));

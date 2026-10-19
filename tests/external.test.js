@@ -4,7 +4,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
   listGoaCalendarAccounts, goaAccessToken, fetchGoogleEvents, fetchIcalBlocks,
-  collectExternalBusy, invalidateCache, redactIdentity, busEnv,
+  collectExternalBusy, invalidateCache, redactIdentity, busEnv, toCalendarEvent,
 } from '../src/external.js';
 
 // busctl --json=short shape: {"type": sig, "data": [managed-objects-dict]}
@@ -252,5 +252,113 @@ describe('identity redaction', () => {
 describe('busEnv', () => {
   test('returns an object', () => {
     expect(typeof busEnv()).toBe('object');
+  });
+});
+
+describe('toCalendarEvent', () => {
+  test('maps a Google block preserving start/end/title/source with ext: id', () => {
+    const ev = toCalendarEvent({
+      start: '2026-10-20T10:00', end: '2026-10-20T11:00',
+      title: 'G meet', source: 'Google calendar', external: true,
+      uid: 'google-evt-1', accountId: 'goa_account_1',
+    });
+    expect(ev.id).toBe('ext:google-evt-1');
+    expect(ev.external).toBe(true);
+    expect(ev.source).toBe('Google calendar');
+    expect(ev.start).toBe('2026-10-20T10:00');
+    expect(ev.end).toBe('2026-10-20T11:00');
+    expect(ev.title).toBe('G meet');
+    expect(ev.occurrenceOf).toBeNull();
+    expect(ev.rrule).toBeNull();
+  });
+
+  test('maps an iCal block with its ICS uid', () => {
+    const ev = toCalendarEvent({
+      start: '2026-10-20T12:00', end: '2026-10-20T13:00',
+      title: 'Ext lunch', source: 'iCal feed', external: true,
+      uid: 'abc-123@example', accountId: 'ical',
+    });
+    expect(ev.id).toBe('ext:abc-123@example');
+    expect(ev.source).toBe('iCal feed');
+  });
+
+  test('falls back to a start|title slug when uid is missing', () => {
+    const ev = toCalendarEvent({
+      start: '2026-10-20T12:00', end: '2026-10-20T13:00',
+      title: 'Busy', source: 'Google calendar', external: true, uid: '',
+    });
+    expect(ev.id).toBe('ext:2026-10-20T12:00|Busy');
+  });
+});
+
+describe('collectExternalBusy per-account statuses', () => {
+  const from = new Date(2026, 9, 19, 0, 0);
+  const to = new Date(2026, 9, 22, 0, 0);
+
+  function objsWithReauth() {
+    return goaObjs({
+      '/org/gnome/OnlineAccounts/Accounts/4': {
+        'org.gnome.OnlineAccounts.Account': {
+          Id: 'goa_account_4', ProviderType: 'google', ProviderName: 'Google',
+          PresentationIdentity: 'other@example.com', CalendarEnabled: true,
+        },
+        'org.gnome.OnlineAccounts.OAuth2Based': {},
+      },
+    });
+  }
+
+  test('synced + needs re-auth + unsupported provider', async () => {
+    invalidateCache();
+    const run = async (cmd, args) => {
+      const key = args.join(' ');
+      if (key.includes('GetManagedObjects')) return { code: 0, stdout: JSON.stringify(objsWithReauth()), stderr: '' };
+      if (key.includes('Accounts/4') && key.includes('EnsureCredentials')) {
+        return { code: 1, stdout: '', stderr: 'org.gnome.OnlineAccounts.Error.NotAuthorized' };
+      }
+      if (key.includes('EnsureCredentials')) return { code: 0, stdout: '{"type":"()","data":[]}', stderr: '' };
+      if (key.includes('GetAccessToken')) return { code: 0, stdout: '{"type":"(s)","data":["tok1"]}', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const fetchFn = async () => ({
+      ok: true,
+      json: async () => ({
+        items: [{ status: 'confirmed', id: 'evt-1', summary: 'Acct1 meet', start: { dateTime: '2026-10-20T14:00:00Z' }, end: { dateTime: '2026-10-20T15:00:00Z' } }],
+      }),
+    });
+    const r = await collectExternalBusy({ goaEnabled: true }, from, to, { run, fetch: fetchFn });
+    const byId = Object.fromEntries(r.accountStatus.map((s) => [s.id, s.status]));
+    expect(byId['goa_account_1']).toBe('synced');
+    expect(byId['goa_account_4']).toBe('needs re-auth');
+    expect(byId['goa_account_2']).toBe('unsupported provider');
+    expect(r.blocks).toHaveLength(1);
+    expect(r.blocks[0].accountId).toBe('goa_account_1');
+    expect(r.blocks[0].uid).toBe('evt-1');
+  });
+
+  test('busctl spawn failure → honest unreachable note', async () => {
+    invalidateCache();
+    const run = async () => { throw new Error('spawn busctl ENOENT'); };
+    const r = await collectExternalBusy({ goaEnabled: true }, from, to, { run });
+    expect(r.note).toContain('GNOME accounts unreachable');
+    expect(r.accountStatus).toEqual([]);
+    expect(r.blocks).toEqual([]);
+  });
+
+  test('iCal blocks are tagged accountId=ical', async () => {
+    invalidateCache();
+    const fetchFn = async () => ({
+      ok: true,
+      text: async () => `BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:z
+SUMMARY:Feed thing
+DTSTART:20261020T090000
+DTEND:20261020T100000
+END:VEVENT
+END:VCALENDAR`,
+    });
+    const blocks = await fetchIcalBlocks('https://x/y.ics', from, to, fetchFn);
+    expect(blocks[0].accountId).toBe('ical');
+    expect(blocks[0].uid).toBe('z');
   });
 });

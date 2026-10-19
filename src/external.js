@@ -79,7 +79,13 @@ const GOA_BUS = 'org.gnome.OnlineAccounts';
 const GOA_ROOT = '/org/gnome/OnlineAccounts';
 
 async function busCall(run, dest, path, iface, method, ...args) {
-  const res = await run('busctl', ['--user', '--json=short', 'call', dest, path, iface, method, ...args]);
+  let res;
+  try {
+    res = await run('busctl', ['--user', '--json=short', 'call', dest, path, iface, method, ...args]);
+  } catch (e) {
+    // busctl missing or spawn failed — same honest outcome as an unreachable daemon
+    throw new ExternalError('unavailable', `GNOME Online Accounts not reachable: ${String(e?.message || e).slice(0, 120)}`);
+  }
   if (res.code !== 0) {
     const err = (res.stderr || res.stdout || '').trim().slice(0, 300);
     if (/ServiceUnknown|Failed to connect|Failed to set bus address|not provided by any|No such/i.test(err)) {
@@ -142,9 +148,10 @@ export async function goaAccessToken(acct, run = defaultRun) {
 
 /**
  * Fetch events from Google's calendar API → busy blocks. `fetchFn` is
- * injectable for tests (defaults to global fetch).
+ * injectable for tests (defaults to global fetch). `accountId` tags blocks
+ * so per-account counts can be reported by /api/sync.
  */
-export async function fetchGoogleEvents(token, timeMin, timeMax, fetchFn = fetch) {
+export async function fetchGoogleEvents(token, timeMin, timeMax, fetchFn = fetch, accountId = null) {
   const url = 'https://www.googleapis.com/calendar/v3/calendars/primary/events?' +
     new URLSearchParams({
       timeMin: timeMin.toISOString(), timeMax: timeMax.toISOString(),
@@ -169,6 +176,7 @@ export async function fetchGoogleEvents(token, timeMin, timeMax, fetchFn = fetch
     blocks.push({
       start, end, title: item.summary || 'Busy',
       source: 'Google calendar', external: true,
+      uid: item.id || '', accountId,
     });
   }
   return blocks;
@@ -186,7 +194,8 @@ export async function fetchIcalBlocks(url, from, to, fetchFn = fetch) {
     const res = await fetchFn(url, { signal: ctrl.signal, headers: { Accept: 'text/calendar' } });
     if (!res.ok) throw new ExternalError('call-failed', `iCal fetch ${res.status}`);
     const text = await res.text();
-    return expandIcal(parseIcs(text), from, to, 'iCal feed');
+    return expandIcal(parseIcs(text), from, to, 'iCal feed')
+      .map((b) => ({ ...b, accountId: 'ical' }));
   } catch (e) {
     if (e instanceof ExternalError) throw e;
     throw new ExternalError('unavailable', `iCal fetch failed: ${String(e?.message || e).slice(0, 120)}`);
@@ -249,7 +258,7 @@ export async function collectExternalBusy(settings, from, to, deps = {}) {
         }
         try {
           const token = await goaAccessToken(acct, run);
-          blocks.push(...await fetchGoogleEvents(token, from, to, fetchFn));
+          blocks.push(...await fetchGoogleEvents(token, from, to, fetchFn, acct.id));
           st.status = 'synced';
         } catch (e) {
           st.status = e instanceof ExternalError && e.kind === 'auth' ? 'needs re-auth' : 'error';
@@ -279,4 +288,26 @@ export function redactIdentity(identity) {
 /** Invalidate the TTL cache (called after settings change). */
 export function invalidateCache() {
   cache.at = 0;
+}
+
+/**
+ * Map an external busy block onto Docket's event shape for the calendar
+ * views. The id is namespaced 'ext:' so mutations can reject it; clients
+ * must treat these as read-only.
+ */
+export function toCalendarEvent(b) {
+  const key = (b.uid && String(b.uid).trim()) || `${b.start}|${b.title}`;
+  return {
+    id: 'ext:' + key,
+    occurrenceOf: null,
+    title: b.title || 'Busy',
+    start: b.start,
+    end: b.end,
+    location: '',
+    notes: '',
+    color: 'gray',
+    rrule: null,
+    external: true,
+    source: b.source || 'external',
+  };
 }
